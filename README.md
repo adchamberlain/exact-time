@@ -155,32 +155,3 @@ This provides millisecond-level accuracy, making it perfect for setting precisio
 **Time Data**: [NIST Internet Time Service](https://www.nist.gov/pml/time-and-frequency-division/time-distribution/internet-time-service-its)
 
 **License**: MIT
-
----
-
-## Adding an App Icon
-
-The asset catalog is set up for an app icon. To add one:
-
-1. Create or generate a 1024x1024 PNG image with a terminal/clock theme
-2. Name it something like `AppIcon.png`
-3. Place it in `ExactTime/ExactTime/Assets.xcassets/AppIcon.appiconset/`
-4. Update `Contents.json` in that folder to reference your filename:
-   ```json
-   {
-     "images" : [
-       {
-         "filename" : "AppIcon.png",
-         "idiom" : "universal",
-         "platform" : "ios",
-         "size" : "1024x1024"
-       }
-     ],
-     "info" : {
-       "author" : "xcode",
-       "version" : 1
-     }
-   }
-   ```
-
-**Icon ideas**: A retro terminal clock face, digital numbers in green-on-black, or an ASCII-style watch face.
