@@ -22,53 +22,51 @@ extension Font {
 // MARK: - Main Content View
 struct ContentView: View {
     @EnvironmentObject var ntpService: NTPService
+    @State private var showingAbout = false
     
     var body: some View {
         // TimelineView updates the view on a schedule - perfect for a clock
         // Update 10x per second for minimal display lag
         TimelineView(.periodic(from: .now, by: 0.1)) { context in
             NavigationStack {
-                ZStack {
-                    Color.black.ignoresSafeArea()
-                    
-                    VStack(spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .center, spacing: 0) {
                         Spacer()
-                        
-                        // ASCII art header
-                        Text(clockAsciiArt)
-                            .font(.terminal(20))
-                            .foregroundColor(.terminalDim)
-                            .multilineTextAlignment(.leading)
-                            .padding(.bottom, 20)
+                            .frame(height: 30)
                         
                         // Main time display - passes the timeline date to trigger updates
                         timeDisplayView(timelineDate: context.date)
                         
                         Spacer()
+                            .frame(height: 20)
                         
                         // Status info
                         statusView
                         
-                        // Re-sync button
+                        Spacer()
+                            .frame(height: 30)
+                        
+                        // About link
                         Button {
-                            Task {
-                                await ntpService.sync()
-                            }
+                            showingAbout = true
                         } label: {
-                            Text("[Re-Sync]")
-                                .font(.terminalBody)
-                                .foregroundColor(.terminalGreen)
-                                .padding(.horizontal, 20)
-                                .padding(.vertical, 10)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .stroke(Color.terminalDim, lineWidth: 1)
-                                )
+                            Text("[About]")
+                                .font(.terminalSmall)
+                                .foregroundColor(.terminalDim)
                         }
-                        .disabled(ntpService.syncState == .syncing)
-                        .padding(.bottom, 40)
+                        
+                        Spacer()
+                            .frame(height: 40)
                     }
-                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.horizontal, 30)
+                }
+                .background(Color.black)
+                .refreshable {
+                    await ntpService.sync()
+                }
+                .sheet(isPresented: $showingAbout) {
+                    AboutView(onDismiss: { showingAbout = false })
                 }
                 .navigationTitle("")
                 .navigationBarTitleDisplayMode(.inline)
@@ -93,14 +91,14 @@ struct ContentView: View {
     @ViewBuilder
     private func timeDisplayView(timelineDate: Date) -> some View {
         // Simple box around the time - all same font size for alignment
-        // Time is 8 chars, + 2 spaces each side + 2 pipes = 14 total width
+        // Time with AM/PM is up to 11 chars (e.g. "12:59:59 PM"), + 2 spaces each side + 2 pipes = 17 total
         let time = formattedTime(for: timelineDate)
         VStack(spacing: 0) {
-            Text("--------------")
+            Text("-----------------")
             Text("|  \(time)  |")
-            Text("--------------")
+            Text("-----------------")
         }
-        .font(.terminal(20))
+        .font(.terminal(22))
         .foregroundColor(.terminalBright)
         .monospacedDigit()
         .padding(.vertical, 20)
@@ -155,7 +153,7 @@ struct ContentView: View {
         // Get accurate time from NTP service (applies offset to current time)
         let accurateTime = ntpService.now()
         let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
+        formatter.dateFormat = "h:mm:ss a"
         return formatter.string(from: accurateTime)
     }
     
@@ -181,21 +179,6 @@ struct ContentView: View {
         case .idle:
             return .terminalDim
         }
-    }
-    
-    // MARK: - ASCII Art
-    
-    private var clockAsciiArt: String {
-        // Each line is exactly 11 characters for proper alignment
-        [
-            "  _______  ",
-            " /  12   \\ ",
-            "|    |    |",
-            "|9   |   3|",
-            "|     \\   |",
-            "|         |",
-            " \\___6___/ "
-        ].joined(separator: "\n")
     }
     
 }

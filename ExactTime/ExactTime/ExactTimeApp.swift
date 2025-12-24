@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct ExactTimeApp: App {
     @StateObject private var ntpService = NTPService.shared
+    @State private var showSplash = true
     
     init() {
         // Configure navigation bar appearance
@@ -16,9 +17,23 @@ struct ExactTimeApp: App {
     
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(ntpService)
+            ZStack {
+                ContentView()
+                    .environmentObject(ntpService)
+                
+                if showSplash {
+                    SplashScreenView()
+                        .zIndex(1)
+                        .onAppear {
+                            // Dismiss splash screen after 3 seconds
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                                withAnimation(.easeOut(duration: 0.3)) {
+                                    showSplash = false
+                                }
+                            }
+                        }
+                }
+            }
         }
     }
 }
-
