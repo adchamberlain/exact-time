@@ -43,7 +43,7 @@ final class Watch {
     }
 
     /// Training status
-    var trainingStatus: TrainingStatus = .notStarted
+    var trainingStatus: TrainingStatus = TrainingStatus.notStarted
 
     /// All accuracy readings for this watch
     @Relationship(deleteRule: .cascade, inverse: \WatchReading.watch)
