@@ -1,5 +1,7 @@
 import UIKit
 import CoreGraphics
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import Accelerate
 
 /// Generates synthetic training data from a reference watch photo
@@ -293,17 +295,16 @@ class SyntheticDataGenerator {
 
 extension SyntheticDataGenerator {
 
-    /// Simple inpainting to remove hands from dial
-    /// Uses the hour hand mask and minute hand mask to identify hand pixels,
-    /// then fills with nearby dial color
+    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
+    /// Inpaint dial to remove hands using CoreImage for smoother results
+    /// Uses multi-pass blur-blend approach for natural-looking fills
     func inpaintDial(
         referenceImage: UIImage,
         hourHandMask: UIImage,
         minuteHandMask: UIImage,
         secondHandMask: UIImage?
     ) -> UIImage? {
-        print("[Inpaint] Starting with image: \(referenceImage.size)")
-
         // Downscale to reasonable size for processing (max 800px on longest side)
         let maxDimension: CGFloat = 800
         let scale = min(maxDimension / referenceImage.size.width, maxDimension / referenceImage.size.height, 1.0)
@@ -312,12 +313,9 @@ extension SyntheticDataGenerator {
             height: referenceImage.size.height * scale
         )
 
-        print("[Inpaint] Scaling to: \(targetSize) (scale factor: \(scale))")
-
         guard let scaledRef = downscale(referenceImage, to: targetSize),
               let scaledHourMask = downscale(hourHandMask, to: targetSize),
               let scaledMinuteMask = downscale(minuteHandMask, to: targetSize) else {
-            print("[Inpaint] Failed to downscale images")
             return nil
         }
 
@@ -326,15 +324,43 @@ extension SyntheticDataGenerator {
         guard let refCG = scaledRef.cgImage,
               let hourMaskCG = scaledHourMask.cgImage,
               let minuteMaskCG = scaledMinuteMask.cgImage else {
-            print("[Inpaint] Failed to get CGImages")
             return nil
         }
 
         let width = refCG.width
         let height = refCG.height
-        print("[Inpaint] Processing at \(width)x\(height)")
 
         // Create combined mask of all hands
+        guard let combinedMask = createCombinedMask(
+            hourMask: hourMaskCG,
+            minuteMask: minuteMaskCG,
+            secondMask: scaledSecondMask?.cgImage,
+            width: width,
+            height: height
+        ) else {
+            return nil
+        }
+
+        // Use CoreImage-based inpainting for smoother results
+        guard let inpainted = inpaintWithCoreImage(image: refCG, mask: combinedMask) else {
+            // Fallback to simple inpainting if CoreImage fails
+            guard let fallback = simpleInpaint(image: refCG, mask: combinedMask) else {
+                return nil
+            }
+            return UIImage(cgImage: fallback)
+        }
+
+        return UIImage(cgImage: inpainted)
+    }
+
+    /// Create combined mask from all hand masks
+    private func createCombinedMask(
+        hourMask: CGImage,
+        minuteMask: CGImage,
+        secondMask: CGImage?,
+        width: Int,
+        height: Int
+    ) -> CGImage? {
         guard let maskContext = CGContext(
             data: nil,
             width: width,
@@ -351,39 +377,83 @@ extension SyntheticDataGenerator {
         maskContext.setFillColor(gray: 0, alpha: 1)
         maskContext.fill(rect)
 
-        // Add hand masks in white
+        // Add hand masks in white using lighten blend
         maskContext.setBlendMode(.lighten)
-        maskContext.draw(hourMaskCG, in: rect)
-        maskContext.draw(minuteMaskCG, in: rect)
-        if let secondMaskCG = scaledSecondMask?.cgImage {
-            maskContext.draw(secondMaskCG, in: rect)
+        maskContext.draw(hourMask, in: rect)
+        maskContext.draw(minuteMask, in: rect)
+        if let secondMask = secondMask {
+            maskContext.draw(secondMask, in: rect)
         }
 
-        guard let combinedMask = maskContext.makeImage() else {
-            print("[Inpaint] Failed to create combined mask")
-            return nil
-        }
-
-        print("[Inpaint] Combined mask created, starting inpaint...")
-
-        // For MVP, use simple nearest-neighbor fill
-        // A more sophisticated approach would use PatchMatch or similar
-        guard let inpainted = simpleInpaint(image: refCG, mask: combinedMask) else {
-            print("[Inpaint] simpleInpaint returned nil")
-            return nil
-        }
-
-        print("[Inpaint] Inpainting complete!")
-        return UIImage(cgImage: inpainted)
+        return maskContext.makeImage()
     }
 
-    /// Simple inpainting using edge pixel colors
+    /// CoreImage-based inpainting using multi-pass blur and blend
+    /// Creates smoother transitions than simple nearest-neighbor fill
+    private func inpaintWithCoreImage(image: CGImage, mask: CGImage) -> CGImage? {
+        let ciImage = CIImage(cgImage: image)
+        let ciMask = CIImage(cgImage: mask)
+
+        // Dilate the mask slightly for better edge coverage
+        let dilatedMask = dilateMask(ciMask, radius: 3)
+
+        // Create heavily blurred version of the image
+        guard let blurFilter = CIFilter(name: "CIGaussianBlur") else { return nil }
+        blurFilter.setValue(ciImage, forKey: kCIInputImageKey)
+        blurFilter.setValue(30.0, forKey: kCIInputRadiusKey)
+
+        guard let blurredImage = blurFilter.outputImage else { return nil }
+
+        // First pass: blend blurred into masked areas
+        guard let firstPass = blendWithMask(
+            background: ciImage,
+            foreground: blurredImage,
+            mask: dilatedMask
+        ) else { return nil }
+
+        // Apply medium blur to first pass result
+        blurFilter.setValue(firstPass, forKey: kCIInputImageKey)
+        blurFilter.setValue(15.0, forKey: kCIInputRadiusKey)
+
+        guard let mediumBlurred = blurFilter.outputImage else { return nil }
+
+        // Second pass: blend medium blur to smooth edges
+        let smallerMask = dilateMask(ciMask, radius: 1)
+        guard let secondPass = blendWithMask(
+            background: firstPass,
+            foreground: mediumBlurred,
+            mask: smallerMask
+        ) else { return nil }
+
+        // Render final result
+        let extent = ciImage.extent
+        return Self.ciContext.createCGImage(secondPass, from: extent)
+    }
+
+    /// Dilate mask to expand coverage area
+    private func dilateMask(_ mask: CIImage, radius: Int) -> CIImage {
+        guard let dilateFilter = CIFilter(name: "CIMorphologyMaximum") else {
+            return mask
+        }
+        dilateFilter.setValue(mask, forKey: kCIInputImageKey)
+        dilateFilter.setValue(Float(radius), forKey: kCIInputRadiusKey)
+        return dilateFilter.outputImage ?? mask
+    }
+
+    /// Blend foreground into background using mask
+    private func blendWithMask(background: CIImage, foreground: CIImage, mask: CIImage) -> CIImage? {
+        guard let blendFilter = CIFilter(name: "CIBlendWithMask") else { return nil }
+        blendFilter.setValue(background, forKey: kCIInputBackgroundImageKey)
+        blendFilter.setValue(foreground, forKey: kCIInputImageKey)
+        blendFilter.setValue(mask, forKey: kCIInputMaskImageKey)
+        return blendFilter.outputImage
+    }
+
+    /// Fallback simple inpainting using nearest-neighbor fill
     private func simpleInpaint(image: CGImage, mask: CGImage) -> CGImage? {
         let width = image.width
         let height = image.height
-        print("[Inpaint] simpleInpaint: \(width)x\(height) = \(width * height) pixels")
 
-        // Get pixel data
         guard let imageContext = CGContext(
             data: nil,
             width: width,
@@ -414,18 +484,10 @@ extension SyntheticDataGenerator {
         let imagePixels = imageData.bindMemory(to: UInt8.self, capacity: width * height * 4)
         let maskPixels = maskData.bindMemory(to: UInt8.self, capacity: width * height)
 
-        // Simple fill: for masked pixels, copy from nearest unmasked pixel
-        // This is a basic approach - could be improved with more sophisticated inpainting
-        var maskedPixelCount = 0
-        var processedCount = 0
-        let startTime = Date()
-
         for y in 0..<height {
             for x in 0..<width {
                 let maskIdx = y * width + x
                 if maskPixels[maskIdx] > 128 {
-                    maskedPixelCount += 1
-                    // This pixel is masked, find nearest unmasked
                     if let (r, g, b) = findNearestUnmaskedColor(
                         x: x, y: y,
                         imagePixels: imagePixels,
@@ -437,18 +499,10 @@ extension SyntheticDataGenerator {
                         imagePixels[pixelIdx] = r
                         imagePixels[pixelIdx + 1] = g
                         imagePixels[pixelIdx + 2] = b
-                        processedCount += 1
                     }
                 }
             }
-            // Log progress every 100 rows
-            if y % 100 == 0 {
-                print("[Inpaint] Row \(y)/\(height), masked so far: \(maskedPixelCount)")
-            }
         }
-
-        let elapsed = Date().timeIntervalSince(startTime)
-        print("[Inpaint] Completed: \(maskedPixelCount) masked pixels, \(processedCount) filled, took \(String(format: "%.2f", elapsed))s")
 
         return imageContext.makeImage()
     }
@@ -459,7 +513,6 @@ extension SyntheticDataGenerator {
         maskPixels: UnsafeMutablePointer<UInt8>,
         width: Int, height: Int
     ) -> (UInt8, UInt8, UInt8)? {
-        // Search in expanding squares
         for radius in 1..<50 {
             for dy in -radius...radius {
                 for dx in -radius...radius {

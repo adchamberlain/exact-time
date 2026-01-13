@@ -4,6 +4,7 @@ import Vision
 import UIKit
 
 /// Service for training and running inference with watch time prediction models
+/// Version 2: Uses Vision framework for feature extraction and weighted interpolation for prediction
 @MainActor
 class WatchMLService: ObservableObject {
 
@@ -20,6 +21,12 @@ class WatchMLService: ObservableObject {
     @Published var errorMessage: String?
 
     private let dataGenerator = SyntheticDataGenerator()
+
+    /// Feature dimension from Vision framework's VNFeaturePrintObservation
+    private let featureDimension = 2048
+
+    /// Number of nearest neighbors for prediction
+    private let kNeighbors = 7
 
     /// Prediction result from the ML model
     struct TimePrediction {
@@ -69,31 +76,21 @@ class WatchMLService: ObservableObject {
             statusMessage = "Preparing dial image..."
             trainingProgress = 0.1
 
-            print("[ML] Starting inpainting...")
-            print("[ML] Reference image size: \(referenceImage.size)")
-            print("[ML] Hour mask size: \(hourMask.size)")
-            print("[ML] Minute mask size: \(minuteMask.size)")
-
             // Give UI a chance to update
             try await Task.sleep(nanoseconds: 50_000_000)
 
             let cleanDial = await Task.detached { [dataGenerator] in
-                let result = dataGenerator.inpaintDial(
+                return dataGenerator.inpaintDial(
                     referenceImage: referenceImage,
                     hourHandMask: hourMask,
                     minuteHandMask: minuteMask,
                     secondHandMask: secondMask
                 )
-                print("[ML] Inpainting complete, result: \(result != nil ? "success" : "nil")")
-                return result
             }.value
 
             guard let cleanDial else {
-                print("[ML] Inpainting failed - cleanDial is nil")
                 throw WatchMLError.inpaintingFailed
             }
-
-            print("[ML] Clean dial size: \(cleanDial.size)")
 
             // Step 3: Generate synthetic training data
             statusMessage = "Generating training data..."
@@ -141,69 +138,74 @@ class WatchMLService: ObservableObject {
         }
     }
 
-    /// Train a Core ML model on the synthetic data
+    /// Train a model on the synthetic data using Vision framework features
     private func trainCoreMLModel(
         samples: [SyntheticDataGenerator.TrainingSample],
         watchId: UUID
     ) async throws -> URL {
-        // For the MVP, we'll create training data and use MLImageClassifier
-        // In production, you'd use a custom neural network with MLUpdateTask
-
-        // Create directories for training data
+        // Create directory for watch model
         let documentsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let watchDir = documentsDir.appendingPathComponent("watches/\(watchId.uuidString)")
-        let trainingDir = watchDir.appendingPathComponent("training")
 
-        try FileManager.default.createDirectory(at: trainingDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: watchDir, withIntermediateDirectories: true)
 
-        // Save training images organized by class
-        // Class format: "H{hour}_M{minute}" (we'll bucket seconds for simplicity)
-        statusMessage = "Preparing training images..."
+        statusMessage = "Extracting features with Vision framework..."
+        trainingProgress = 0.45
 
-        var progress = 0.4
-        let progressIncrement = 0.3 / Double(samples.count)
+        // Extract Vision features from each sample
+        var trainingSamples: [ModelDataV2.Sample] = []
+        let totalSamples = samples.count
+        var processedCount = 0
 
-        for sample in samples {
-            // Create class directory (bucket by 5-minute intervals for manageable class count)
-            let minuteBucket = (sample.minute / 5) * 5
-            let className = String(format: "H%02d_M%02d", sample.hour, minuteBucket)
-            let classDir = trainingDir.appendingPathComponent(className)
+        // Process samples in batches to avoid memory issues
+        let batchSize = 50
+        for batchStart in stride(from: 0, to: samples.count, by: batchSize) {
+            let batchEnd = min(batchStart + batchSize, samples.count)
+            let batch = samples[batchStart..<batchEnd]
 
-            try FileManager.default.createDirectory(at: classDir, withIntermediateDirectories: true)
+            for sample in batch {
+                let image = UIImage(cgImage: sample.image)
 
-            // Save image
-            let imageName = "\(sample.hour)_\(sample.minute)_\(sample.second).png"
-            let imageURL = classDir.appendingPathComponent(imageName)
+                // Extract features using Vision framework (off main thread)
+                let featuresResult: [Float]? = await Task.detached {
+                    return try? await self.extractFeaturesWithVision(from: image)
+                }.value
 
-            if let pngData = UIImage(cgImage: sample.image).pngData() {
-                try pngData.write(to: imageURL)
-            }
+                if let features = featuresResult {
+                    trainingSamples.append(ModelDataV2.Sample(
+                        features: features,
+                        hour: sample.hour,
+                        minute: sample.minute,
+                        second: sample.second
+                    ))
+                }
 
-            progress += progressIncrement
-            await MainActor.run {
-                self.trainingProgress = min(progress, 0.7)
+                processedCount += 1
+                let progress = 0.45 + (0.45 * Double(processedCount) / Double(totalSamples))
+                await MainActor.run {
+                    self.trainingProgress = progress
+                    if processedCount % 100 == 0 {
+                        self.statusMessage = "Extracting features... \(processedCount)/\(totalSamples)"
+                    }
+                }
             }
         }
 
-        // Use Create ML's MLImageClassifier for training
-        // Note: This is a simplified approach for MVP
-        // For production, use MLUpdateTask with a custom neural network
+        statusMessage = "Saving model..."
+        trainingProgress = 0.92
 
-        statusMessage = "Training classifier..."
-        trainingProgress = 0.75
-
-        // For on-device training, we need to use MLUpdateTask
-        // However, for the MVP, we'll create a simple k-NN based model
-        // that can be trained quickly on device
-
-        let modelURL = try await createAndTrainKNNModel(
-            trainingDir: trainingDir,
-            outputDir: watchDir,
-            watchId: watchId
+        // Save the v2 model with Vision features and exact time labels
+        let modelData = ModelDataV2(
+            version: 2,
+            featureDimension: featureDimension,
+            createdAt: Date(),
+            samples: trainingSamples
         )
 
-        // Clean up training images
-        try? FileManager.default.removeItem(at: trainingDir)
+        let modelURL = watchDir.appendingPathComponent("model.json")
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(modelData)
+        try data.write(to: modelURL)
 
         trainingProgress = 0.95
         statusMessage = "Finalizing model..."
@@ -211,102 +213,55 @@ class WatchMLService: ObservableObject {
         return modelURL
     }
 
-    /// Create and train a k-NN model (faster on-device training)
-    private func createAndTrainKNNModel(
-        trainingDir: URL,
-        outputDir: URL,
-        watchId: UUID
-    ) async throws -> URL {
-        // For MVP: Store feature vectors and labels for k-NN inference
-        // This is much faster than training a neural network on device
+    // MARK: - Feature Extraction
 
-        var featureVectors: [[Float]] = []
-        var labels: [(hour: Int, minute: Int)] = []
+    /// Extract features using Vision framework's VNFeaturePrintObservation
+    /// This provides 2048-dimensional neural network features that capture semantic content
+    private func extractFeaturesWithVision(from image: UIImage) async throws -> [Float] {
+        guard let cgImage = image.cgImage else {
+            throw WatchMLError.featureExtractionFailed
+        }
 
-        let classDirectories = try FileManager.default.contentsOfDirectory(
-            at: trainingDir,
-            includingPropertiesForKeys: nil
-        ).filter { $0.hasDirectoryPath }
-
-        for classDir in classDirectories {
-            // Parse class name
-            let className = classDir.lastPathComponent
-            let components = className.split(separator: "_")
-            guard components.count == 2,
-                  let hour = Int(components[0].dropFirst()),
-                  let minute = Int(components[1].dropFirst()) else {
-                continue
-            }
-
-            // Get images in this class
-            let images = try FileManager.default.contentsOfDirectory(
-                at: classDir,
-                includingPropertiesForKeys: nil
-            ).filter { $0.pathExtension == "png" }
-
-            for imageURL in images {
-                if let imageData = try? Data(contentsOf: imageURL),
-                   let image = UIImage(data: imageData),
-                   let features = extractFeatures(from: image) {
-                    featureVectors.append(features)
-                    labels.append((hour: hour, minute: minute))
+        return try await withCheckedThrowingContinuation { continuation in
+            let request = VNGenerateImageFeaturePrintRequest { request, error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                    return
                 }
+
+                guard let observation = request.results?.first as? VNFeaturePrintObservation else {
+                    continuation.resume(throwing: WatchMLError.featureExtractionFailed)
+                    return
+                }
+
+                // Extract the feature vector data
+                let elementCount = observation.elementCount
+                var features = [Float](repeating: 0, count: elementCount)
+
+                // Copy feature data
+                let data = observation.data
+                data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+                    let floatBuffer = buffer.bindMemory(to: Float.self)
+                    for i in 0..<elementCount {
+                        features[i] = floatBuffer[i]
+                    }
+                }
+
+                continuation.resume(returning: features)
+            }
+
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            do {
+                try handler.perform([request])
+            } catch {
+                continuation.resume(throwing: error)
             }
         }
-
-        // Save the model data
-        let modelData = KNNModelData(
-            featureVectors: featureVectors,
-            labels: labels
-        )
-
-        let modelURL = outputDir.appendingPathComponent("model.json")
-        let encoder = JSONEncoder()
-        let data = try encoder.encode(modelData)
-        try data.write(to: modelURL)
-
-        return modelURL
-    }
-
-    /// Extract simple features from an image for k-NN
-    private func extractFeatures(from image: UIImage) -> [Float]? {
-        guard let cgImage = image.cgImage else { return nil }
-
-        // Resize to small size for feature extraction
-        let size = 32
-        guard let context = CGContext(
-            data: nil,
-            width: size,
-            height: size,
-            bitsPerComponent: 8,
-            bytesPerRow: size * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-
-        context.interpolationQuality = .medium
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: size, height: size))
-
-        guard let data = context.data else { return nil }
-
-        let pixels = data.bindMemory(to: UInt8.self, capacity: size * size * 4)
-
-        // Convert to grayscale feature vector
-        var features: [Float] = []
-        for i in 0..<(size * size) {
-            let r = Float(pixels[i * 4]) / 255.0
-            let g = Float(pixels[i * 4 + 1]) / 255.0
-            let b = Float(pixels[i * 4 + 2]) / 255.0
-            let gray = 0.299 * r + 0.587 * g + 0.114 * b
-            features.append(gray)
-        }
-
-        return features
     }
 
     // MARK: - Inference
 
-    /// Predict time from an image using a trained model
+    /// Predict time from an image using a trained model with weighted interpolation
     func predict(image: UIImage, modelPath: String) async throws -> TimePrediction {
         let modelURL = URL(fileURLWithPath: modelPath)
 
@@ -314,55 +269,172 @@ class WatchMLService: ObservableObject {
             throw WatchMLError.modelNotFound
         }
 
-        // Load k-NN model
+        // Load model (supports both v1 and v2 formats)
         let data = try Data(contentsOf: modelURL)
         let decoder = JSONDecoder()
-        let modelData = try decoder.decode(KNNModelData.self, from: data)
 
-        // Extract features from input image
-        guard let queryFeatures = extractFeatures(from: image) else {
-            throw WatchMLError.featureExtractionFailed
+        // Try v2 format first, fall back to v1
+        let modelData: ModelDataV2
+        if let v2Data = try? decoder.decode(ModelDataV2.self, from: data), v2Data.version == 2 {
+            modelData = v2Data
+        } else if let v1Data = try? decoder.decode(KNNModelData.self, from: data) {
+            // Convert v1 to v2 format for processing
+            modelData = ModelDataV2(
+                version: 1,
+                featureDimension: 1024,
+                createdAt: Date(),
+                samples: v1Data.labels.enumerated().map { idx, label in
+                    ModelDataV2.Sample(
+                        features: v1Data.featureVectors[idx],
+                        hour: label.hour,
+                        minute: label.minute,
+                        second: 0
+                    )
+                }
+            )
+        } else {
+            throw WatchMLError.modelNotFound
         }
 
-        // Find k nearest neighbors
-        let k = 5
-        let distances = modelData.featureVectors.enumerated().map { (idx, features) -> (Int, Float) in
-            let dist = euclideanDistance(queryFeatures, features)
-            return (idx, dist)
-        }.sorted { $0.1 < $1.1 }
+        // Extract features from input image using Vision framework
+        let queryFeatures = try await extractFeaturesWithVision(from: image)
 
-        // Vote on the result
-        var votes: [String: Int] = [:]
-        for i in 0..<min(k, distances.count) {
-            let idx = distances[i].0
-            let label = modelData.labels[idx]
-            let key = "\(label.hour)_\(label.minute)"
-            votes[key, default: 0] += 1
+        // Find k nearest neighbors with distances
+        let neighbors = findKNearestNeighbors(
+            queryFeatures: queryFeatures,
+            samples: modelData.samples,
+            k: kNeighbors
+        )
+
+        // Use weighted interpolation to predict continuous time
+        let prediction = weightedInterpolation(neighbors: neighbors)
+
+        return prediction
+    }
+
+    /// Find k nearest neighbors using Euclidean distance
+    private func findKNearestNeighbors(
+        queryFeatures: [Float],
+        samples: [ModelDataV2.Sample],
+        k: Int
+    ) -> [(distance: Float, hour: Int, minute: Int, second: Int)] {
+        let distances = samples.map { sample -> (distance: Float, hour: Int, minute: Int, second: Int) in
+            let dist = euclideanDistance(queryFeatures, sample.features)
+            return (dist, sample.hour, sample.minute, sample.second)
         }
 
-        // Find winning class
-        guard let winner = votes.max(by: { $0.value < $1.value }) else {
-            throw WatchMLError.predictionFailed
+        return Array(distances.sorted { $0.distance < $1.distance }.prefix(k))
+    }
+
+    /// Weighted interpolation for continuous time prediction
+    /// Handles circular nature of time (e.g., 11:59 -> 12:00 wraparound)
+    private func weightedInterpolation(
+        neighbors: [(distance: Float, hour: Int, minute: Int, second: Int)]
+    ) -> TimePrediction {
+        guard !neighbors.isEmpty else {
+            return TimePrediction(hour: 0, minute: 0, second: 0, confidence: 0)
         }
 
-        let components = winner.key.split(separator: "_")
-        let hour = Int(components[0]) ?? 0
-        let minute = Int(components[1]) ?? 0
+        // Convert times to angles (radians) for circular interpolation
+        // Hour angle: 0-12 hours maps to 0-2π
+        // Minute angle: 0-60 minutes maps to 0-2π
+        // Second angle: 0-60 seconds maps to 0-2π
 
-        // Confidence based on vote proportion
-        let confidence = Double(winner.value) / Double(k)
+        var totalWeight: Double = 0
+        var hourSinSum: Double = 0
+        var hourCosSum: Double = 0
+        var minuteSinSum: Double = 0
+        var minuteCosSum: Double = 0
+        var secondSinSum: Double = 0
+        var secondCosSum: Double = 0
+
+        let minDistance = neighbors.first?.distance ?? 1.0
+        let epsilon: Float = 0.0001
+
+        for neighbor in neighbors {
+            // Inverse distance weighting (add epsilon to avoid division by zero)
+            let weight = Double(1.0 / (neighbor.distance + epsilon))
+            totalWeight += weight
+
+            // Convert hour to angle (12-hour clock)
+            let hourAngle = Double(neighbor.hour % 12) / 12.0 * 2.0 * .pi
+            hourSinSum += sin(hourAngle) * weight
+            hourCosSum += cos(hourAngle) * weight
+
+            // Convert minute to angle
+            let minuteAngle = Double(neighbor.minute) / 60.0 * 2.0 * .pi
+            minuteSinSum += sin(minuteAngle) * weight
+            minuteCosSum += cos(minuteAngle) * weight
+
+            // Convert second to angle
+            let secondAngle = Double(neighbor.second) / 60.0 * 2.0 * .pi
+            secondSinSum += sin(secondAngle) * weight
+            secondCosSum += cos(secondAngle) * weight
+        }
+
+        // Average the angles using atan2 for proper circular mean
+        let avgHourAngle = atan2(hourSinSum / totalWeight, hourCosSum / totalWeight)
+        let avgMinuteAngle = atan2(minuteSinSum / totalWeight, minuteCosSum / totalWeight)
+        let avgSecondAngle = atan2(secondSinSum / totalWeight, secondCosSum / totalWeight)
+
+        // Convert back to time values
+        var hour = Int(round((avgHourAngle < 0 ? avgHourAngle + 2.0 * .pi : avgHourAngle) / (2.0 * .pi) * 12.0))
+        var minute = Int(round((avgMinuteAngle < 0 ? avgMinuteAngle + 2.0 * .pi : avgMinuteAngle) / (2.0 * .pi) * 60.0))
+        var second = Int(round((avgSecondAngle < 0 ? avgSecondAngle + 2.0 * .pi : avgSecondAngle) / (2.0 * .pi) * 60.0))
+
+        // Normalize values
+        hour = hour % 12
+        minute = minute % 60
+        second = second % 60
+
+        // Calculate confidence based on neighbor agreement
+        // Higher confidence when neighbors are close together and agree on time
+        let confidence = calculateConfidence(neighbors: neighbors, predictedHour: hour, predictedMinute: minute)
 
         return TimePrediction(
             hour: hour,
             minute: minute,
-            second: 0,  // k-NN doesn't predict seconds in MVP
+            second: second,
             confidence: confidence
         )
     }
 
+    /// Calculate confidence based on how well neighbors agree
+    private func calculateConfidence(
+        neighbors: [(distance: Float, hour: Int, minute: Int, second: Int)],
+        predictedHour: Int,
+        predictedMinute: Int
+    ) -> Double {
+        guard !neighbors.isEmpty else { return 0 }
+
+        // Calculate average time deviation from prediction
+        var totalDeviation: Double = 0
+        for neighbor in neighbors {
+            // Time difference in minutes (handling 12-hour wraparound)
+            let neighborMinutes = neighbor.hour * 60 + neighbor.minute
+            let predictedMinutes = predictedHour * 60 + predictedMinute
+
+            var diff = abs(neighborMinutes - predictedMinutes)
+            // Handle wraparound (12 hours = 720 minutes)
+            if diff > 360 {
+                diff = 720 - diff
+            }
+            totalDeviation += Double(diff)
+        }
+
+        let avgDeviation = totalDeviation / Double(neighbors.count)
+
+        // Convert deviation to confidence (0-30 minute deviation maps to 1.0-0.0)
+        let maxDeviation: Double = 30.0
+        let confidence = max(0, 1.0 - (avgDeviation / maxDeviation))
+
+        return confidence
+    }
+
     private func euclideanDistance(_ a: [Float], _ b: [Float]) -> Float {
         var sum: Float = 0
-        for i in 0..<min(a.count, b.count) {
+        let count = min(a.count, b.count)
+        for i in 0..<count {
             let diff = a[i] - b[i]
             sum += diff * diff
         }
@@ -372,6 +444,22 @@ class WatchMLService: ObservableObject {
 
 // MARK: - Supporting Types
 
+/// V2 model format with Vision framework features and exact time labels
+struct ModelDataV2: Codable {
+    let version: Int
+    let featureDimension: Int
+    let createdAt: Date
+    let samples: [Sample]
+
+    struct Sample: Codable {
+        let features: [Float]
+        let hour: Int
+        let minute: Int
+        let second: Int
+    }
+}
+
+/// V1 model format (for backwards compatibility)
 struct KNNModelData: Codable {
     let featureVectors: [[Float]]
     let labels: [TimeLabel]
